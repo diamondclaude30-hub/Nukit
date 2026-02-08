@@ -1,11 +1,15 @@
 package com.nukit.npchelper;
 
 import cn.nukkit.Player;
+import cn.nukkit.entity.Entity;
 import cn.nukkit.entity.EntityCreature;
 import cn.nukkit.entity.passive.EntityVillager;
-import cn.nukkit.inventory.SimpleInventory;
+import cn.nukkit.inventory.BaseInventory;
+import cn.nukkit.inventory.InventoryHolder;
+import cn.nukkit.inventory.InventoryType;
 import cn.nukkit.level.Level;
 import cn.nukkit.level.Position;
+import cn.nukkit.level.format.FullChunk;
 import cn.nukkit.math.Vector3;
 import cn.nukkit.nbt.tag.CompoundTag;
 import cn.nukkit.network.protocol.AnimateEntityPacket;
@@ -14,27 +18,35 @@ import cn.nukkit.utils.TextFormat;
 
 import java.util.UUID;
 
-public class NpcHelperEntity extends EntityVillager {
+public class NpcHelperEntity extends EntityVillager implements InventoryHolder {
     private static final int INVENTORY_SIZE = 27;
 
-    private final SimpleInventory inventory = new SimpleInventory(INVENTORY_SIZE);
+    private final BaseInventory inventory;
     private final NpcHelperAI ai;
     private UUID ownerId;
 
     public NpcHelperEntity(Level level, CompoundTag nbt) {
         super(level, nbt);
+        this.inventory = new NpcHelperInventory(this, INVENTORY_SIZE);
         this.ai = new NpcHelperAI(this);
     }
 
     public static NpcHelperEntity spawn(Level level, Player owner, Position position) {
+        FullChunk chunk = level.getChunk(position.getFloorX() >> 4, position.getFloorZ() >> 4);
+        if (chunk == null) {
+            return null;
+        }
         CompoundTag nbt = EntityCreature.getDefaultNBT(position);
-        NpcHelperEntity entity = new NpcHelperEntity(level, nbt);
+        Entity created = Entity.createEntity("NpcHelperVillager", chunk, nbt);
+        if (!(created instanceof NpcHelperEntity entity)) {
+            return null;
+        }
         entity.ownerId = owner.getUniqueId();
         entity.spawnToAll();
         entity.setNameTagVisible(true);
         entity.setNameTagAlwaysVisible(true);
         entity.setNameTag(TextFormat.AQUA + owner.getName() + "'s Helper");
-        entity.setHealth(20);
+        entity.setHealth(20f);
         entity.setMaxHealth(20);
         entity.setImmobile(false);
         return entity;
@@ -55,7 +67,8 @@ public class NpcHelperEntity extends EntityVillager {
         return ownerId != null && ownerId.equals(player.getUniqueId());
     }
 
-    public SimpleInventory getInventory() {
+    @Override
+    public BaseInventory getInventory() {
         return inventory;
     }
 
@@ -65,7 +78,7 @@ public class NpcHelperEntity extends EntityVillager {
 
     public void swingArm() {
         AnimateEntityPacket packet = new AnimateEntityPacket();
-        packet.entityRuntimeId = this.getId();
+        packet.eid = this.getId();
         packet.action = AnimateEntityPacket.ACTION_SWING_ARM;
         broadcastPacket(packet);
     }
@@ -83,7 +96,7 @@ public class NpcHelperEntity extends EntityVillager {
         float currentYaw = this.getYaw();
         float delta = wrapDegrees((float) (targetYaw - currentYaw));
         float clamped = Math.max(-maxYawChange, Math.min(maxYawChange, delta));
-        this.setRotation(currentYaw + clamped, this.getPitch());
+        this.setRotation((float) (currentYaw + clamped), this.getPitch());
         this.setHeadYaw(this.getYaw());
     }
 
@@ -96,5 +109,21 @@ public class NpcHelperEntity extends EntityVillager {
             wrapped += 360.0f;
         }
         return wrapped;
+    }
+
+    private static class NpcHelperInventory extends BaseInventory {
+        NpcHelperInventory(InventoryHolder holder, int size) {
+            super(holder, InventoryType.CHEST, size);
+        }
+
+        @Override
+        public String getName() {
+            return "NPC Helper";
+        }
+
+        @Override
+        public String getDefaultTitle() {
+            return getName();
+        }
     }
 }

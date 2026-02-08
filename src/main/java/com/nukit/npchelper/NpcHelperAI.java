@@ -4,31 +4,33 @@ import cn.nukkit.Player;
 import cn.nukkit.Server;
 import cn.nukkit.block.Block;
 import cn.nukkit.block.BlockID;
+import cn.nukkit.inventory.BaseInventory;
 import cn.nukkit.item.Item;
 import cn.nukkit.level.Level;
 import cn.nukkit.level.particle.DestroyBlockParticle;
 import cn.nukkit.math.Vector3;
-import cn.nukkit.scheduler.AsyncTask;
 import cn.nukkit.utils.TextFormat;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
 public class NpcHelperAI {
     private static final int SEARCH_RADIUS = 12;
     private static final int FOLLOW_DISTANCE = 20;
-    private static final int MAX_INVENTORY = 27;
-    private static final int PATH_SCAN_RADIUS = 16;
+    private static final int PATH_RADIUS = 16;
+    private static final double WALK_SPEED = 0.22;
 
     private final NpcHelperEntity entity;
     private State state = State.IDLE;
     private Vector3 targetBlock;
     private final Deque<Vector3> path = new ArrayDeque<>();
     private int stuckTicks;
-    private boolean pathRequestPending;
 
     public NpcHelperAI(NpcHelperEntity entity) {
         this.entity = entity;
@@ -56,15 +58,14 @@ public class NpcHelperAI {
         switch (state) {
             case IDLE -> handleIdle(owner);
             case SEARCHING -> handleSearching();
-            case NAVIGATING -> handleNavigating();
+            case MOVING -> handleMoving();
             case MINING -> handleMining();
-            case DROPPING -> handleDropping(owner);
         }
     }
 
     private void handleIdle(Player owner) {
         if (!inventoryHasSpace()) {
-            state = State.DROPPING;
+            owner.sendMessage(TextFormat.GOLD + "Your helper is ready to unload items.");
             return;
         }
         if (entity.distance(owner) > 4) {
@@ -76,16 +77,17 @@ public class NpcHelperAI {
 
     private void handleSearching() {
         Optional<Vector3> target = findNearestResource();
-        if (target.isPresent()) {
-            targetBlock = target.get();
-            state = State.NAVIGATING;
-            requestPath();
-        } else {
+        if (target.isEmpty()) {
             state = State.IDLE;
+            return;
         }
+        targetBlock = target.get();
+        path.clear();
+        path.addAll(buildPath(entity.getPosition(), targetBlock));
+        state = path.isEmpty() ? State.IDLE : State.MOVING;
     }
 
-    private void handleNavigating() {
+    private void handleMoving() {
         if (targetBlock == null) {
             state = State.IDLE;
             return;
@@ -95,20 +97,18 @@ public class NpcHelperAI {
             state = State.MINING;
             return;
         }
-        if (path.isEmpty() && !pathRequestPending) {
-            requestPath();
+        if (path.isEmpty()) {
+            state = State.SEARCHING;
+            return;
         }
-        if (!path.isEmpty()) {
-            Vector3 next = path.peek();
-            if (entity.distance(next) < 0.7) {
-                path.poll();
-                stuckTicks = 0;
-            } else {
-                moveTo(next);
-            }
+        Vector3 next = path.peek();
+        if (entity.distance(next) < 0.7) {
+            path.poll();
+            stuckTicks = 0;
         } else {
-            stuckTicks++;
+            moveTo(next);
         }
+        stuckTicks++;
     }
 
     private void handleMining() {
@@ -130,16 +130,7 @@ public class NpcHelperAI {
         level.addParticle(new DestroyBlockParticle(block.add(0.5, 0.5, 0.5), block));
         level.setBlock(block, Block.get(BlockID.AIR), true);
         entity.getInventory().addItem(Item.get(block.getId(), 0, 1));
-        state = inventoryHasSpace() ? State.SEARCHING : State.DROPPING;
-    }
-
-    private void handleDropping(Player owner) {
-        if (entity.distance(owner) > 2.5) {
-            moveTo(owner.getPosition());
-            return;
-        }
-        owner.sendMessage(TextFormat.GOLD + "Your helper is ready to unload items.");
-        state = State.IDLE;
+        state = inventoryHasSpace() ? State.SEARCHING : State.IDLE;
     }
 
     private void moveTo(Vector3 destination) {
@@ -148,7 +139,7 @@ public class NpcHelperAI {
             entity.setMotion(new Vector3());
             return;
         }
-        Vector3 motion = direction.normalize().multiply(0.22);
+        Vector3 motion = direction.normalize().multiply(WALK_SPEED);
         entity.setMotion(motion);
         entity.rotateTowards(destination, 8f);
     }
@@ -189,121 +180,140 @@ public class NpcHelperAI {
         return Optional.ofNullable(best);
     }
 
+    private List<Vector3> buildPath(Vector3 start, Vector3 rawTarget) {
+        Vector3 startNode = toGrid(start);
+        Vector3 targetNode = resolveWalkableTarget(rawTarget);
+        if (targetNode == null) {
+            return List.of();
+        }
+        Level level = entity.getLevel();
+        if (!isChunkLoaded(level, startNode) || !isChunkLoaded(level, targetNode)) {
+            return List.of();
+        }
+
+        int minX = startNode.getFloorX() - PATH_RADIUS;
+        int maxX = startNode.getFloorX() + PATH_RADIUS;
+        int minY = startNode.getFloorY() - 4;
+        int maxY = startNode.getFloorY() + 4;
+        int minZ = startNode.getFloorZ() - PATH_RADIUS;
+        int maxZ = startNode.getFloorZ() + PATH_RADIUS;
+
+        Deque<Vector3> queue = new ArrayDeque<>();
+        Map<String, Vector3> cameFrom = new HashMap<>();
+        Map<String, Boolean> visited = new HashMap<>();
+        queue.add(startNode);
+        visited.put(key(startNode), true);
+
+        int[][] dirs = {
+                {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1},
+                {0, 1, 0}, {0, -1, 0}
+        };
+
+        while (!queue.isEmpty()) {
+            Vector3 current = queue.poll();
+            if (current.equals(targetNode)) {
+                return reconstructPath(cameFrom, current);
+            }
+            for (int[] dir : dirs) {
+                Vector3 next = current.add(dir[0], dir[1], dir[2]);
+                if (next.getFloorX() < minX || next.getFloorX() > maxX
+                        || next.getFloorY() < minY || next.getFloorY() > maxY
+                        || next.getFloorZ() < minZ || next.getFloorZ() > maxZ) {
+                    continue;
+                }
+                String key = key(next);
+                if (visited.containsKey(key)) {
+                    continue;
+                }
+                if (!isWalkable(level, next)) {
+                    continue;
+                }
+                visited.put(key, true);
+                cameFrom.put(key, current);
+                queue.add(next);
+            }
+        }
+        return List.of();
+    }
+
+    private List<Vector3> reconstructPath(Map<String, Vector3> cameFrom, Vector3 current) {
+        List<Vector3> pathList = new ArrayList<>();
+        pathList.add(toCenter(current));
+        String currentKey = key(current);
+        while (cameFrom.containsKey(currentKey)) {
+            Vector3 prev = cameFrom.get(currentKey);
+            pathList.add(0, toCenter(prev));
+            currentKey = key(prev);
+        }
+        return pathList;
+    }
+
+    private Vector3 resolveWalkableTarget(Vector3 rawTarget) {
+        if (rawTarget == null) {
+            return null;
+        }
+        Vector3 target = toGrid(rawTarget);
+        Level level = entity.getLevel();
+        if (isWalkable(level, target)) {
+            return target;
+        }
+        int[][] offsets = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (int[] offset : offsets) {
+            Vector3 candidate = target.add(offset[0], offset[1], offset[2]);
+            if (isWalkable(level, candidate)) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private Vector3 toGrid(Vector3 vector) {
+        return new Vector3(vector.getFloorX(), vector.getFloorY(), vector.getFloorZ());
+    }
+
+    private Vector3 toCenter(Vector3 vector) {
+        return new Vector3(vector.getFloorX() + 0.5, vector.getFloorY(), vector.getFloorZ() + 0.5);
+    }
+
+    private String key(Vector3 vector) {
+        return vector.getFloorX() + ":" + vector.getFloorY() + ":" + vector.getFloorZ();
+    }
+
+    private boolean isWalkable(Level level, Vector3 position) {
+        if (!isChunkLoaded(level, position)) {
+            return false;
+        }
+        Block head = level.getBlock(position.getFloorX(), position.getFloorY() + 1, position.getFloorZ());
+        Block body = level.getBlock(position.getFloorX(), position.getFloorY(), position.getFloorZ());
+        Block feet = level.getBlock(position.getFloorX(), position.getFloorY() - 1, position.getFloorZ());
+        return body.isTransparent() && head.isTransparent() && feet.isSolid();
+    }
+
     private boolean isDesiredBlock(Block block) {
         return block.getId() == BlockID.DIAMOND_ORE || block.getId() == BlockID.LOG;
     }
 
     private Player getOwner() {
         UUID ownerId = entity.getOwnerId();
-        return ownerId == null ? null : Server.getInstance().getPlayer(ownerId);
-    }
-
-    private void requestPath() {
-        if (pathRequestPending || targetBlock == null) {
-            return;
-        }
-        pathRequestPending = true;
-        Level level = entity.getLevel();
-        Vector3 start = entity.getPosition();
-        Vector3 target = targetBlock;
-        if (!isChunkLoaded(level, start) || !isChunkLoaded(level, target)) {
-            pathRequestPending = false;
-            return;
-        }
-        WalkableSnapshot snapshot = WalkableSnapshot.capture(level, start, PATH_SCAN_RADIUS);
-        Server.getInstance().getScheduler().scheduleAsyncTask(new AsyncTask() {
-            @Override
-            public void onRun() {
-                Vector3 walkableTarget = resolveWalkableTarget(snapshot, target);
-                List<Vector3> computed = PathfindingTask.computePath(snapshot, start, walkableTarget);
-                setResult(computed);
-            }
-
-            @Override
-            public void onCompletion(Server server) {
-                List<Vector3> result = getResult();
-                path.clear();
-                if (result != null) {
-                    path.addAll(result);
-                }
-                pathRequestPending = false;
-            }
-        });
-    }
-
-    private Vector3 resolveWalkableTarget(WalkableSnapshot snapshot, Vector3 rawTarget) {
-        if (rawTarget == null) {
+        if (ownerId == null) {
             return null;
         }
-        Vector3 target = rawTarget.clone();
-        if (snapshot.isWalkable(target)) {
-            return target;
-        }
-        int[][] offsets = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
-        for (int[] offset : offsets) {
-            Vector3 candidate = target.add(offset[0], offset[1], offset[2]);
-            if (snapshot.isWalkable(candidate)) {
-                return candidate;
-            }
-        }
-        return target;
+        return Server.getInstance().getPlayer(ownerId).orElse(null);
+    }
+
+    private boolean inventoryHasSpace() {
+        BaseInventory inventory = entity.getInventory();
+        return inventory.firstEmpty() != -1;
+    }
+
+    private boolean isChunkLoaded(Level level, Vector3 position) {
+        return level.isChunkLoaded(position.getFloorX() >> 4, position.getFloorZ() >> 4);
     }
 
     enum State {
         IDLE,
         SEARCHING,
-        NAVIGATING,
-        MINING,
-        DROPPING
-    }
-
-    public record WalkableSnapshot(int radius, int centerX, int centerY, int centerZ, boolean[][][] walkable) {
-        static WalkableSnapshot capture(Level level, Vector3 center, int radius) {
-            int size = radius * 2 + 1;
-            boolean[][][] walkable = new boolean[size][size][size];
-            int baseX = center.getFloorX() - radius;
-            int baseY = center.getFloorY() - radius;
-            int baseZ = center.getFloorZ() - radius;
-            for (int x = 0; x < size; x++) {
-                for (int y = 0; y < size; y++) {
-                    for (int z = 0; z < size; z++) {
-                        int worldX = baseX + x;
-                        int worldY = baseY + y;
-                        int worldZ = baseZ + z;
-                        if (!level.isChunkLoaded(worldX >> 4, worldZ >> 4)) {
-                            walkable[x][y][z] = false;
-                            continue;
-                        }
-                        Block head = level.getBlock(worldX, worldY + 1, worldZ);
-                        Block body = level.getBlock(worldX, worldY, worldZ);
-                        Block feet = level.getBlock(worldX, worldY - 1, worldZ);
-                        boolean passable = body.isTransparent() && head.isTransparent() && feet.isSolid();
-                        walkable[x][y][z] = passable;
-                    }
-                }
-            }
-            return new WalkableSnapshot(radius, center.getFloorX(), center.getFloorY(), center.getFloorZ(), walkable);
-        }
-
-        boolean isWalkable(Vector3 position) {
-            int sx = position.getFloorX() - (centerX - radius);
-            int sy = position.getFloorY() - (centerY - radius);
-            int sz = position.getFloorZ() - (centerZ - radius);
-            if (sx < 0 || sy < 0 || sz < 0) {
-                return false;
-            }
-            if (sx >= walkable.length || sy >= walkable[0].length || sz >= walkable[0][0].length) {
-                return false;
-            }
-            return walkable[sx][sy][sz];
-        }
-    }
-
-    private boolean inventoryHasSpace() {
-        return entity.getInventory().getContents().size() < MAX_INVENTORY;
-    }
-
-    private boolean isChunkLoaded(Level level, Vector3 position) {
-        return level.isChunkLoaded(position.getFloorX() >> 4, position.getFloorZ() >> 4);
+        MOVING,
+        MINING
     }
 }
